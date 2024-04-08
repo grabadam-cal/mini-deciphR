@@ -7,15 +7,15 @@
 #' @param assay_slot Which seurat assay_slot to perform NMF on, defaults to RNA counts. For advanced users, see documentation for discussion of performing NMF on SCTransformed count data.
 #' @param Sample.thresh Minimum number of samples a given cell type must be present across for NMF
 #' @param Type.thresh Minimum number of cells per cell type in n Sample.thresh samples to be included for NMF
-#' @param Batch
-#' @param scale.factor
-#' @param log.norm
-#' @param k.min,k.max
-#' @param n.reps
-#' @param nn.pt
-#' @param max.cores
-#' @param output.reps
-#' @param return.scale.data
+#' @param Batch Sequencing batch
+#' @param scale.factor Scale.factor for count normalization
+#' @param log.norm Perform log normalization on counts
+#' @param k.min,k.max Max and min k's for k.sweep
+#' @param n.reps Number of reps for consensus nmf
+#' @param nn.pt Resolution for nearest neighbors clustering for consensus nmf
+#' @param max.cores N cores to use for parallelization.
+#' @param output.reps Save individual NMF reps. Default FALSE.
+#' @param return.scale.data Save scaled data. Defualt FALSE
 #'
 #' @return a list containing k sweep consensus NMF results
 #'
@@ -28,13 +28,14 @@
 #' @import cluster
 #' @import stats
 #' @import rlist
+#' @import liger
 #' @import RANN
 #' @export
 
 
 iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sample.thresh = 10, Batch = TRUE,
                             scale.factor = 10000, log.norm = TRUE, k.min = 2, k.max = 40, n.reps = 20, nn.pt = 0.3,
-                            max.cores = parallelly::availableCores(), output.reps = FALSE, return.scale.data = T){
+                            max.cores = parallelly::availableCores(), output.reps = FALSE, return.scale.data = F){
   if (!"Sample"%in%colnames(seurat.object@meta.data) |
       !"CellType"%in%colnames(seurat.object@meta.data)){
     stop("metadata slot must contain colnames 'Sample' and 'CellType'")
@@ -47,10 +48,11 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
   if (round(n.reps*nn.pt)<=1){
     stop("n.reps or nn.pt too low to find consensus results")
   }
-
-
-  # Process Seurat object and determine which cell types to analyze
   DefaultAssay(seurat.object)=assay_slot
+  if (!assay_slot%in%seurat.object@assays){
+    stop('Supplied assay slot not in sequencing object')
+  }
+  # Process Seurat object and determine which cell types to analyze
   # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
   cell.types <- names(which(colSums(table(seurat.object@meta.data[,c("Sample","CellType")])>=Type.thresh)>=Sample.thresh))
   if (length(cell.types)==0){
@@ -71,17 +73,17 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
         Batch.list <- SplitObject(seu_sub, split.by="Batch")
         Liger.setup=list()
         for (j in 1:length(Batch.list)){
-          Liger.setup[[j]]=Batch.list[[j]]@assays$RNA@counts
+          Liger.setup[[j]]=GetAssayData(Batch.list[[j]], slot = 'counts') #updating so single function interoperable with multiple data slots, using improved interaction functions for SeuratObject
         }
         names(Liger.setup)=names(Batch.list)
         Liger <- createLiger(Liger.setup)
       }
     } else {
       seu_sub <- AddMetaData(seu_sub, col.name = 'Batch', metadata = rep('Batch1', nrow(seu_sub@meta.data)))
-      Liger <- createLiger(list(Batch1 = seu_sub@assays[[assay_slot]]@data))
+      Liger <- createLiger(list(Batch1 = GetAssayData(seu_sub, slot = 'counts'))) #even for SCT normalization, residuals converted back to 'corrected' UMI counts, pre log-normalization per SeuratV5 Documentation
     }
     # normalize so all cells have same total counts
-    Liger <- rliger::normalize(Liger) #still need to normalize and select variable genes for integrated object
+    Liger <- rliger::normalize(Liger) #still need to select variable genes for object regardless of normalization method
     Liger <- selectGenes(Liger)
     if (log.norm){
       # log normalize (this combined with the normalize step above is the same as LogNormalize in Seurat)
@@ -89,10 +91,10 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
         Liger@norm.data[[k]]=as.sparse(as.matrix(log1p(Liger@norm.data[[k]]*scale.factor)))}
     } else{
       for (k in 1:length(Liger@norm.data)){
-        Liger@norm.data[[k]]=as.sparse(as.matrix(Liger@norm.data[[k]]))}
+        Liger@norm.data[[k]]=as.sparse(as.matrix(Liger@norm.data[[k]]))} #should always be counts slot regardless of normalization/pre-processing method
     }
     # scale without centering
-    Liger <- rliger::scaleNotCenter(Liger) # does need to be re-scaled (pull from integrated assay's data slot not integrated assay's 'scale.data' slot)
+    Liger <- rliger::scaleNotCenter(Liger) # does need to be re-scaled (if integrated, pull from integrated assay's data slot not integrated assay's 'scale.data' slot)
 
     # adjust online_iNMF parameters based on dataset size
     minibatch_size <- min(table(seu_sub@meta.data$Batch))
