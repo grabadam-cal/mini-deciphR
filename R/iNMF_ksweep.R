@@ -48,9 +48,9 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
   if (round(n.reps*nn.pt)<=1){
     stop("n.reps or nn.pt too low to find consensus results")
   }
-  DefaultAssay(seurat.object)=assay_slot
   if (!assay_slot%in%seurat.object@assays){
     stop('Supplied assay slot not in sequencing object')
+  DefaultAssay(seurat.object)=assay_slot
   }
   # Process Seurat object and determine which cell types to analyze
   # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
