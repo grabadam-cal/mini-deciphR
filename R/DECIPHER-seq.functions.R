@@ -1,383 +1,24 @@
 ##### Set up LIGER objects and run consensus iNMF across range of K values #################
-iNMF_ksweep_RNA <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sample.thresh = 10, Batch = TRUE, 
-                        scale.factor = 10000, log.norm = TRUE, k.min = 2, k.max = 40, n.reps = 20, nn.pt = 0.3,
-                        max.cores = getOption("mc.cores", 2L), output.reps = FALSE, return.scale.data = T){
-  if (!"Sample"%in%colnames(seurat.object@meta.data) | 
-      !"CellType"%in%colnames(seurat.object@meta.data)){
-    stop("metadata slot must contain colnames 'Sample' and 'CellType'")
-  }
-  if (Batch){
-    if (!"Batch"%in%colnames(seurat.object@meta.data)){
-      stop("metadata slot must contain colname 'Batch'")
-    }
-  }
-  if (round(n.reps*nn.pt)<=1){
-    stop("n.reps or nn.pt too low to find consensus results")
-  }
-  library(rliger); library(Matrix); library(matrixStats); library(parallel); 
-  library(cluster); library(stats); library(rlist); library(liger); library(RANN)
-  
-  # Process Seurat object and determine which cell types to analyze
-  DefaultAssay(seurat.object)=assay_slot
-  # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
-  cell.types <- names(which(colSums(table(seurat.object@meta.data[,c("Sample","CellType")])>=Type.thresh)>=Sample.thresh))
-  if (length(cell.types)==0){
-    stop("Not enough cells to meet input Sample/Type thresholds")
-  } else if (length(cell.types)==1){
-    warning("Only one cell type met input Sample/Type thresholds")
-  }
-  print(paste0("Running consensus iNMF on the following ", length(cell.types), " cell types: ", paste(cell.types, collapse = ", ")))
-  
-  # SET UP LIGER OBJECTS AND RUN K SWEEP
-  print(paste0('Creating Liger objects and running k sweep...'))
-  names(cell.types) = cell.types
-  res <- lapply(cell.types, function(x){
-    print(paste0("Cell type ", x))
-    seu_sub <- subset(seurat.object, CellType==x)
-    if (Batch){
-      if (length(table(seurat.object$Batch))>1){
-        Batch.list <- SplitObject(seu_sub, split.by="Batch")
-        Liger.setup=list()
-        for (j in 1:length(Batch.list)){
-          Liger.setup[[j]]=Batch.list[[j]]@assays$RNA@counts
-        }
-        names(Liger.setup)=names(Batch.list)
-        Liger <- createLiger(Liger.setup)
-      } 
-    } else {
-      seu_sub <- AddMetaData(seu_sub, col.name = 'Batch', metadata = rep('Batch1', nrow(seu_sub@meta.data)))
-      Liger <- createLiger(list(Batch1 = seu_sub@assays[[assay_slot]]@data)) 
-    }
-    # normalize so all cells have same total counts
-    Liger <- rliger::normalize(Liger) #still need to normalize and select variable genes for integrated object
-    Liger <- selectGenes(Liger) 
-    if (log.norm){
-    # log normalize (this combined with the normalize step above is the same as LogNormalize in Seurat)
-      for (k in 1:length(Liger@norm.data)){
-        Liger@norm.data[[k]]=as.sparse(as.matrix(log1p(Liger@norm.data[[k]]*scale.factor)))}
-    } else{
-      for (k in 1:length(Liger@norm.data)){
-        Liger@norm.data[[k]]=as.sparse(as.matrix(Liger@norm.data[[k]]))} 
-      }
-    # scale without centering
-    Liger <- rliger::scaleNotCenter(Liger) # does need to be re-scaled (pull from integrated assay's data slot not integrated assay's 'scale.data' slot)
-    
-    # adjust online_iNMF parameters based on dataset size
-    minibatch_size <- min(table(seu_sub@meta.data$Batch))
-    if (minibatch_size > 5000) {
-      minibatch_size = 5000} else if (minibatch_size > 1000) { 
-        minibatch_size = floor(minibatch_size/1000)*1000} else if (minibatch_size > 500) { 
-          minibatch_size = floor(minibatch_size/500)*500} else if (minibatch_size > 100) { 
-            minibatch_size = floor(minibatch_size/100)*100} else minibatch_size = minibatch_size 
-    h5_chunk_size <- min(1000, minibatch_size)
-    
-    Liger_list = list()
-    for (k in c(k.min:k.max)){
-      print(paste0('Running K = ', k))
-      reps.k = rep(k, n.reps)
-      names(reps.k) = paste0("rep", 1:length(reps.k))
-      Liger_list[[paste0("R", k)]] = mcmapply(LIGER.run, K = reps.k, Liger = c(Liger), 
-                                              minibatch_size = minibatch_size, h5_chunk_size = h5_chunk_size,
-                                              SIMPLIFY = F, mc.cores = max.cores)
-      for (i in 1:length(Liger_list[[paste0("R", k)]])){
-        colnames(Liger_list[[paste0("R", k)]][[i]][["W"]]) =  paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["W"]])) 
-        colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]) = paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]))
-        Liger_list[[paste0("R", k)]][[i]][["V"]] = lapply(Liger_list[[paste0("R", k)]][[i]][["V"]], function(y) {
-          colnames(y) = paste0("Rep", i, "_", colnames(y))
-          return(y)})
-      }
-      print(paste0('Done with ', x, ' K = ', k))
-    }
-    
-    # FIND CONSENSUS RESULTS
-    print(paste0('Finding consensus results'))
-    Consensus.results = mclapply(Liger_list, function(x){
-      W_list = lapply(x, '[[', 'W')
-      W_2norm = rapply(W_list, f = function(y) {apply(y, MARGIN = 2, FUN = function(y){norm(y, type ="2")})},
-                       how = "replace")
-      W_list = rapply(W_list, f = function(y) {t(apply(y, MARGIN = 2, FUN = function(y) {y/norm(y, type = "2")}))},
-                      how = "replace")
-      W.mat = list.rbind(W_list)
-      kmeans_clusts = dim(W.mat)[1]/n.reps
-      
-      # find mean distance to nearest neighbors
-      nn.dist = rowMeans(RANN::nn2(as.matrix(W.mat), k = n.reps)$nn.dists[,c(1:round(n.reps*nn.pt))+1])
-      names(nn.dist) = rownames(W.mat)
-      
-      # filter outliers
-      min = diff(quantile(nn.dist, probs = c(0.25, 0.75)))*0.5 + quantile(nn.dist, probs = c(0.75))
-      if (sum(nn.dist>min)>0) {
-        W.mat.filt = W.mat[-which(nn.dist>min),]
-      } else {
-        W.mat.filt = W.mat
-      }
-      
-      # perform kmeans clustering
-      km.res = kmeans(W.mat.filt, centers = kmeans_clusts, nstart = 100, iter.max = 100)
-      
-      # find consensus W (shared gene loadings)
-      W_consensus = matrix(nrow = kmeans_clusts, ncol = ncol(W.mat.filt))
-      for (i in seq(kmeans_clusts)){
-        row.ind = which(km.res$cluster==i)
-        if (length(row.ind) > 1){
-          W_consensus[i,] = colMedians(W.mat.filt[row.ind,])
-        } else W_consensus[i,] = W.mat.filt[row.ind,]
-      }
-      rownames(W_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      colnames(W_consensus) = colnames(W.mat.filt)
-      
-      # find consensus V (batch-specific gene loadings)
-      V_list = lapply(x, `[[`, "V")
-      for (i in names(V_list)){
-        V_list[[i]] = lapply(V_list[[i]], function(x){t(t(x)*(1/W_2norm[[i]]))})
-      }
-      V.mat = t(list.cbind(lapply(V_list, list.rbind)))
-      if (sum(nn.dist>min)>0) {
-        V.mat.filt = V.mat[-which(nn.dist>min),]
-      } else {
-        V.mat.filt = V.mat
-      }
-      V_consensus = matrix(nrow = kmeans_clusts, ncol = ncol(V.mat.filt))
-      for (i in seq(kmeans_clusts)){
-        row.ind = which(km.res$cluster==i)
-        if (length(row.ind) > 1){
-          V_consensus[i,] = colMedians(V.mat.filt[row.ind,])
-        } else V_consensus[i,] = V.mat.filt[row.ind,]
-      }
-      rownames(V_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      colnames(V_consensus) = colnames(V.mat.filt)
-      Batch.info = 1:length(V_list$rep1)
-      names(Batch.info) = sort(names(V_list$rep1))
-      V_consensus = lapply(Batch.info, function(x){
-        V = V_consensus[,((x-1)*length(colnames(W_consensus))+1):(x*length(colnames(W_consensus)))]
-      })
-      
-      # Solve for H (activity program expression scores) using consensus W and V initializations
-      H_consensus_list = lapply(Batch.info, function(x){
-        H = solveNNLS(rbind(t(W_consensus) + t(V_consensus[[x]]), 
-                            sqrt(5) * t(V_consensus[[x]])), rbind(t(Liger@scale.data[[x]]), matrix(0, 
-                                                                                                   dim(W_consensus)[2], dim(Liger@raw.data[[x]])[2])))
-      })
-      H_consensus_list = lapply(H_consensus_list, t)
-      H_consensus = list.rbind(H_consensus_list)
-      rownames(H_consensus) = rownames((lapply(x, `[[`, "H"))[[1]])
-      colnames(H_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      consensus_res = list(H = H_consensus, W = W_consensus, V = V_consensus)
-      return(consensus_res)
-    })
-    print(paste0('Done with ', x))
-    
-    res = list()
-    if (return.scale.data){
-      res[["scale.data"]] = Liger@scale.data
-    }
-    if (output.reps) {
-      res[["Liger.list"]] = Liger_list
-    } 
-    res[["consensus.results"]] = Consensus.results
-    return(res)
-  })
-  return(res)
-}
-
-iNMF_ksweep_SCT <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Batch = TRUE, 
-                        scale.factor = 10000, k.min = 2, k.max = 40, n.reps = 20, nn.pt = 0.3,
-                        max.cores = getOption("mc.cores", 2L), output.reps = FALSE, return.scale.data = T){
-  if (!"Sample"%in%colnames(seurat.object@meta.data) | 
-      !"CellType"%in%colnames(seurat.object@meta.data)){
-    stop("metadata slot must contain colnames 'Sample' and 'Type'")
-  }
-  if (Batch){
-    if (!"Batch"%in%colnames(seurat.object@meta.data)){
-      seurat.object <- AddMetaData(seurat.object, col.name = 'Batch', metadata = rep('Batch1', nrow(seurat.object@meta.data)))
-    }
-  }
-  if (round(n.reps*nn.pt)<=1){
-    stop("n.reps or nn.pt too low to find consensus results")
-  }
- 
-  library(rliger); library(Matrix); library(matrixStats); library(parallel); 
-  library(cluster); library(stats); library(rlist); library(liger); library(RANN)
-  
-  # Process Seurat object and determine which cell types to analyze
-  DefaultAssay(seurat.object)="SCT"
-  if ("integrated" %in% Assays(seurat.object)){
-    seurat.object[['integrated']] <- NULL
-  }
-  # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
-  cell.types <- names(which(colSums(table(seurat.object@meta.data[,c("Sample","CellType")])>=Type.thresh)>=Sample.thresh))
-  if (length(cell.types)==0){
-    stop("Not enough cells to meet input Sample/Type thresholds")
-  } else if (length(cell.types)==1){
-    warning("Only one cell type met input Sample/Type thresholds")
-  }
-  print(paste0("Running consensus iNMF on the following ", length(cell.types), " cell types: ", paste(cell.types, collapse = ", ")))
-  
-  # SET UP LIGER OBJECTS AND RUN K SWEEP
-  print(paste0('Creating Liger objects and running k sweep...'))
-  names(cell.types) = cell.types
-  res <- lapply(cell.types, function(x){
-    print(paste0("Cell type ", x))
-    seu_sub <- subset(seurat.object, CellType==x)
-    if (Batch){
-      if (length(table(seurat.object$Batch))>1){
-        Batch.list <- SplitObject(seu_sub, split.by="Batch")
-        Liger.setup=list()
-        for (j in 1:length(Batch.list)){
-          Liger.setup[[j]]=Batch.list[[j]]@assays$SCT@counts
-        }
-        names(Liger.setup)=names(Batch.list)
-        Liger <- createLiger(Liger.setup)
-      } 
-    } else {
-      seu_sub <- AddMetaData(seu_sub, col.name = 'Batch', metadata = rep('Batch1', nrow(seu_sub@meta.data)))
-      Liger <- createLiger(list(Batch1 = seu_sub@assays$SCT@counts))
-    }
-    # normalize so all cells have same total counts
-    Liger <- rliger::normalize(Liger)
-    Liger <- selectGenes(Liger)
-    # scale without centering
-    Liger <- rliger::scaleNotCenter(Liger)
-    
-    # adjust online_iNMF parameters based on dataset size
-    files = grep('^Liger_list', list.files(), value = TRUE)
-    
-      minibatch_size <- min(table(seu_sub@meta.data$Batch))
-      if (minibatch_size > 5000) {
-        minibatch_size = 5000} else if (minibatch_size > 1000) { 
-          minibatch_size = floor(minibatch_size/1000)*1000} else if (minibatch_size > 500) { 
-            minibatch_size = floor(minibatch_size/500)*500} else if (minibatch_size > 100) { 
-              minibatch_size = floor(minibatch_size/100)*100} else minibatch_size = minibatch_size 
-      h5_chunk_size <- min(1000, minibatch_size)
-      
-      Liger_list = list()
-      for (k in c(k.min:k.max)){
-        print(paste0('Running K = ', k))
-        reps.k = rep(k, n.reps)
-        names(reps.k) = paste0("rep", 1:length(reps.k))
-        Liger_list[[paste0("R", k)]] = mcmapply(LIGER.run, K = reps.k, Liger = c(Liger), 
-                                                minibatch_size = minibatch_size, h5_chunk_size = h5_chunk_size,
-                                                SIMPLIFY = F, mc.cores = max.cores)
-        for (i in 1:length(Liger_list[[paste0("R", k)]])){
-          colnames(Liger_list[[paste0("R", k)]][[i]][["W"]]) =  paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["W"]])) 
-          colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]) = paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]))
-          Liger_list[[paste0("R", k)]][[i]][["V"]] = lapply(Liger_list[[paste0("R", k)]][[i]][["V"]], function(y) {
-            colnames(y) = paste0("Rep", i, "_", colnames(y))
-            return(y)})
-        }
-        print(paste0('Done with ', x, ' K = ', k))
-      }
-    # FIND CONSENSUS RESULTS
-    print(paste0('Finding consensus results'))
-    Consensus.results = mclapply(Liger_list, function(x){
-      W_list = lapply(x, '[[', 'W')
-      W_2norm = rapply(W_list, f = function(y) {apply(y, MARGIN = 2, FUN = function(y){norm(y, type ="2")})},
-                       how = "replace")
-      W_list = rapply(W_list, f = function(y) {t(apply(y, MARGIN = 2, FUN = function(y) {y/norm(y, type = "2")}))},
-                      how = "replace")
-      W.mat = list.rbind(W_list)
-      kmeans_clusts = dim(W.mat)[1]/n.reps
-      
-      # find mean distance to nearest neighbors
-      nn.dist = rowMeans(RANN::nn2(as.matrix(W.mat), k=n.reps)$nn.dists[,c(1:round(n.reps*nn.pt))+1])
-      names(nn.dist) = rownames(W.mat)
-      
-      # filter outliers
-      min = diff(quantile(nn.dist, probs = c(0.25, 0.75)))*0.5 + quantile(nn.dist, probs = c(0.75))
-      if (sum(nn.dist>min)>0) {
-        W.mat.filt = W.mat[-which(nn.dist>min),]
-      } else {
-        W.mat.filt = W.mat
-      }
-      
-      # perform kmeans clustering
-      km.res = kmeans(W.mat.filt, centers = kmeans_clusts, nstart = 100, iter.max = 100)
-      
-      # find consensus W (shared gene loadings)
-      W_consensus = matrix(nrow = kmeans_clusts, ncol = ncol(W.mat.filt))
-      for (i in seq(kmeans_clusts)){
-        row.ind = which(km.res$cluster==i)
-        if (length(row.ind) > 1){
-          W_consensus[i,] = colMedians(W.mat.filt[row.ind,])
-        } else W_consensus[i,] = W.mat.filt[row.ind,]
-      }
-      rownames(W_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      colnames(W_consensus) = colnames(W.mat.filt)
-      
-      # find consensus V (batch-specific gene loadings)
-      V_list = lapply(x, `[[`, "V")
-      for (i in names(V_list)){
-        V_list[[i]] = lapply(V_list[[i]], function(x){t(t(x)*(1/W_2norm[[i]]))})
-      }
-      V.mat = t(list.cbind(lapply(V_list, list.rbind)))
-      if (sum(nn.dist>min)>0) {
-        V.mat.filt = V.mat[-which(nn.dist>min),]
-      } else {
-        V.mat.filt = V.mat
-      }
-      V_consensus = matrix(nrow = kmeans_clusts, ncol = ncol(V.mat.filt))
-      for (i in seq(kmeans_clusts)){
-        row.ind = which(km.res$cluster==i)
-        if (length(row.ind) > 1){
-          V_consensus[i,] = colMedians(V.mat.filt[row.ind,])
-        } else V_consensus[i,] = V.mat.filt[row.ind,]
-      }
-      rownames(V_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      colnames(V_consensus) = colnames(V.mat.filt)
-      Batch.info = 1:length(V_list$rep1)
-      names(Batch.info) = sort(names(V_list$rep1))
-      V_consensus = lapply(Batch.info, function(x){
-        V = V_consensus[,((x-1)*length(colnames(W_consensus))+1):(x*length(colnames(W_consensus)))]
-      })
-      
-      # Solve for H (activity program expression scores) using consensus W and V initializations
-      H_consensus_list = lapply(Batch.info, function(x){
-        H = solveNNLS(rbind(t(W_consensus) + t(V_consensus[[x]]), 
-                            sqrt(5) * t(V_consensus[[x]])), rbind(t(Liger@scale.data[[x]]), matrix(0, 
-                                                                                                   dim(W_consensus)[2], dim(Liger@raw.data[[x]])[2])))
-      })
-      H_consensus_list = lapply(H_consensus_list, t)
-      H_consensus = list.rbind(H_consensus_list)
-      rownames(H_consensus) = rownames((lapply(x, `[[`, "H"))[[1]])
-      colnames(H_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
-      consensus_res = list(H = H_consensus, W = W_consensus, V = V_consensus)
-      return(consensus_res)
-    })
-    print(paste0('Done with ', x))
-    
-    res = list()
-    if (return.scale.data){
-      res[["scale.data"]] = Liger@scale.data
-    }
-    if (output.reps) {
-      res[["Liger.list"]] = Liger_list
-    } 
-    res[["consensus.results"]] = Consensus.results
-    return(res)
-  })
-  return(res)
-}
 
 # build phylogenetic trees based on activity program gene loadings ####
 build_phylo_tree <- function(x){
-  
+
   # add in dummy program as outgroup to root tree (for depth-first search)
   W_list = lapply(x$consensus.results, '[[', "W")
   W_list = lapply(W_list, t)
-  #W_list[["root"]] <- as.matrix(data.frame(root = sample(rowMedians(W_list$R2))))
   W_list[["root"]] <- as.matrix(data.frame(root = rowMedians(W_list$R2)))
   W_list = W_list[c("root", names(x$consensus.results))]
-  
+
   # build phylogenetic tree
   cor_mat = cor(list.cbind(W_list))
   phylo_tree = fastme.bal(1-cor_mat)
   phylo_tree = root(phylo_tree, outgroup = "root", resolve.root = T)
   phylo_tree = drop.tip(phylo_tree, "root")
-  # convert negative branches to zero and filter 
+  # convert negative branches to zero and filter
   phylo_tree_pruned = phylo_tree
   phylo_tree_pruned$edge.length[phylo_tree_pruned$edge.length<0]=0
   dist_mat = cophenetic.phylo(phylo_tree_pruned)
-  
+
   return(list(phylo_tree = phylo_tree, phylo_tree_pruned = phylo_tree_pruned, distance_matrix = dist_mat))
 }
 
@@ -440,15 +81,15 @@ partition_phylo_tree <- function(x, y, dist.thresh = NULL, outlier.thresh = 5){
   ans <- as.character(assign)
   ans <- ans[1:ntips]
   names(ans) <- tree$tip.label
-  
+
   # identify outlier activity programs
   outliers = unlist(lapply(y, function(z) names(which(z>outlier.thresh))))
   ans[outliers] = "outlier"
-  
+
   # set minimum subtree size to at least 2
   ans = plyr::mapvalues(ans, names(which(table(ans)<=2)), rep("0", length(names(which(table(ans)<=2)))))
   return(ans)
-  
+
 }
 
 # Calculate the weighted number of subtrees identified at each K ####
@@ -516,28 +157,28 @@ Construct_network <- function(Expression_score_cor){
   mat[is.na(mat)] <- 0
   mat_pos = mat
   mat_pos[mat_pos<0] = 0
-  
+
   network <- graph_from_adjacency_matrix(mat, weighted=T, mode="undirected", diag=F)
   E(network)$sign = E(network)$weight
   E(network)$weight = abs(E(network)$weight)
   E(network)$sign[E(network)$sign<0] = -1
   E(network)$sign[E(network)$sign>0] = 1
-  
+
   # For visualization purposes, we create the layout from positive edges only, but do community detection (and wTO filtering in the next step) on the signed weighted graph
   network_pos <- graph_from_adjacency_matrix(mat_pos, weighted=T, mode="undirected", diag=F)
   coords = layout_with_fr(network_pos, niter = 10000)
   res = list(network = network, network_coords = coords, mat = mat, network_pos = network_pos)
 }
 
-# Perform community detection 
+# Perform community detection
 
 CPM <- function(adjacency_matrix){
   py_run_string("import leidenalg as la; import igraph as ig; import numpy as np")
   py_run_string("G = ig.Graph.Weighted_Adjacency(r.adjacency_matrix.tolist())")
-  
+
   # sweep across a range of resolutions
   py_run_string("optimiser = la.Optimiser()")
-  py_run_string("profile = optimiser.resolution_profile(G, la.CPMVertexPartition, 
+  py_run_string("profile = optimiser.resolution_profile(G, la.CPMVertexPartition,
           weights = 'weight', resolution_range=(0.001, 0.4), number_iterations = 0)")
   sweep = py$profile
   modularity = lapply(sweep, function(x){x$modularity})
@@ -545,7 +186,7 @@ CPM <- function(adjacency_matrix){
   partition_use = sweep[[which.max(unlist(modularity))]]
   py_run_string("partition = r.partition_use")
   py_run_string("diff = optimiser.optimise_partition(partition)")
-  
+
   # Optimise this partition
   while(py$diff!=0){
     py_run_string("diff = optimiser.optimise_partition(partition)")
@@ -568,7 +209,7 @@ Filter_network = function(Network){
     clust_topo_overlap[clust] = mean(topo_overlap[names(which(modules==clust)),names(which(modules==clust))][upper.tri(topo_overlap[names(which(modules==clust)),names(which(modules==clust))], diag = F)])
   }
   clust_size = table(Network$modules)
-  
+
   # Permuation trial 1: expected mean topo overlap of all nodes within a module (by chance)
   # Use this to filter out modules with poor topological overlap
   reps = 10000
@@ -580,10 +221,10 @@ Filter_network = function(Network){
       res = mean(topo_overlap[ind,ind][upper.tri(topo_overlap[ind,ind], diag = F)])
     })
   }
-  modules_keep = intersect(which(clust_topo_overlap > 
+  modules_keep = intersect(which(clust_topo_overlap >
                                    apply(boot_topo_overlap, 1, function(x) {quantile(x, 0.99, na.rm = T)})),
                            which(table(modules)>=4))
-  
+
   # Permutation trial 2: expected mean topo overlap of a node with other nodes in the same module (by chance)
   # Use this to filter out isolated nodes within a module
   reps = 10000
@@ -652,7 +293,7 @@ Permutation_test_gene_cor <- function(Network, gene_correlation_matrix, reps = 1
       } else res = NA
       return(res)})
   }
-  
+
   node_pval <- rep(NA, ncol(gene_correlation_matrix))
   names(node_pval) <- colnames(gene_correlation_matrix)
   for (node in colnames(gene_correlation_matrix)){
@@ -701,23 +342,23 @@ Infer_direct_interactions <- function(Expression_score, Network, metadata, cellt
         res[["adjR"]][[i]][[j]] = summary(lm(Factor2 ~ Factor1 * freq))$adj.r.squared
         res[["adjR_noFreq"]][[i]][[j]] = summary(lm(Factor2 ~ Factor1))$adj.r.squared
       } else {
-        res[["summary"]][[i]][[j]] = res[["summary_noFreq"]][[i]][[j]] = res[["pval_Fact1"]][[i]][[j]] = res[["pval_freq"]][[i]][[j]] = 
+        res[["summary"]][[i]][[j]] = res[["summary_noFreq"]][[i]][[j]] = res[["pval_Fact1"]][[i]][[j]] = res[["pval_freq"]][[i]][[j]] =
           res[["pval_interaction"]][[i]][[j]] =  res[["pval_overall"]][[i]][[j]] = res[["coef_interaction"]][[i]][[j]] =
           res[["adjR"]][[i]][[j]] = res[["adjR_noFreq"]][[i]][[j]] = NA
       }
     }
   }
-  
-  ind = which(unlist(res$pval_interaction)<0.01 & 
-                unlist(res$coef_interaction)>0 & 
-                unlist(res$pval_freq)>0.05 & 
+
+  ind = which(unlist(res$pval_interaction)<0.01 &
+                unlist(res$coef_interaction)>0 &
+                unlist(res$pval_freq)>0.05 &
                 unlist(res$pval_Fact1)>0.05 &
                 unlist(res$adjR) > adjRsquared.thresh &
                 p.adjust(unlist(res$pval_overall), method = "fdr")<0.01)
-  
+
   res_mat = matrix(NA, ncol = ncol(mat_sub), nrow = nrow(mat_sub))
   res_mat[ind] = unlist(res$adjR)[ind]
-  
+
   res = list(results = res, inds = ind, adjacency_matrix = res_mat)
   return(res)
 }
@@ -764,7 +405,7 @@ fgsea_test <- function(marker_gene_list, Network, path_list){
     res_list = apply(marker_gene_matrix, 2, function(x){
       Program_test = as.numeric(x)
       names(Program_test) = rownames(marker_gene_matrix)
-      res = fgsea(pathways = path_list, stats = Program_test, 
+      res = fgsea(pathways = path_list, stats = Program_test,
                   minSize=10, maxSize=Inf, eps=1e-50, nPermSimple=1000000)
     })
     res_mat = list.rbind(res_list)
@@ -786,19 +427,19 @@ fgsea_test <- function(marker_gene_list, Network, path_list){
 # Permutation test to calculate fdr of gene set enrichment within a module ####
 Get_enrichment_pvals <- function(sets_to_test, Network, nreps = 10000){
   mat = Network$mat[names(Network$filtered_modules), names(Network$filtered_modules)]
-  
+
   # only test for enrichment on nodes within filtered network
   fgsea_test = sets_to_test[paste0(sets_to_test$Type, ".", sets_to_test$Program)%in%names(Network$filtered_modules),]
-  
+
   # only test for enrichment for gene sets with at least two  significantly enriched nodes (fdr < 0.01) #customized for jdm based on smallest modules only featuring 5 nodes
-  fgsea_test = subset(fgsea_test, pathway %in% names(which(table(subset(fgsea_test, fdr < 0.01&NES>0)$pathway)>=2))) 
-  
+  fgsea_test = subset(fgsea_test, pathway %in% names(which(table(subset(fgsea_test, fdr < 0.01&NES>0)$pathway)>=2)))
+
   message(paste0("Testing ", length(unique(fgsea_test$pathway)), " gene sets"))
-  
+
   # only test for positive enrichment
   fgsea_test$fdr[fgsea_test$NES<0] = 1
   fgsea_test$fdr[is.na(fgsea_test$fdr)] = 1
-  
+
   Test = unique(fgsea_test$pathway)
   names(Test) = Test
   clust_size = table(Network$filtered_modules)
@@ -816,7 +457,7 @@ Get_enrichment_pvals <- function(sets_to_test, Network, nreps = 10000){
     node_boot_fgsea_fdr = list.cbind(node_boot_fgsea_fdr)
     return(node_boot_fgsea_fdr)
   })
-  
+
   enrichment_pval = list()
   for (test in names(node_boot_fgsea_fdr)){
     Test_fgsea_test = subset(fgsea_test, pathway==test)
@@ -857,11 +498,11 @@ Calculate_metadata_associations <- function(Network, Expression_score, metadata,
     if (length(levels(factor(H.score.comb$feature.to.test)))>2){
       stop("Create new metadata column with two levels or select categorical>2 type")
     }
-    
+
     test_conditions = levels(factor(metadata[,feature.to.test]))
     group1 = unique(metadata[which(metadata[,feature.to.test]==test_conditions[1]),]$Sample)
     group2 = unique(metadata[which(metadata[,feature.to.test]==test_conditions[2]),]$Sample)
-    
+
     rownames(res) = c("effect_size", "effect_size_sign", "p_value")
     if(filtered == TRUE){
       for (i in colnames(res)){
@@ -884,7 +525,7 @@ Calculate_metadata_associations <- function(Network, Expression_score, metadata,
     # categorical variable with more than 2 groups
     if (length(levels(factor(H.score.comb$feature.to.test)))<=2){
       stop("2 or less levels detected for feature. Select binary type")
-    } 
+    }
     rownames(res) = c("effect_size-eta^2", "effect_size_sign", "p_value")
     pairwise_comp = list()
     if(filtered == TRUE){
@@ -911,7 +552,7 @@ Calculate_metadata_associations <- function(Network, Expression_score, metadata,
     if (class(H.score.comb$feature.to.test)!="numeric"){
       warning("Converting metadata feature.to.test to continuous variable")
       H.score.comb$feature.to.test = as.numeric(H.score.comb$feature.to.test)
-    } 
+    }
     if(filtered == TRUE){
       for (i in names(Network$filtered_modules)){
         res[c("effect_size"),i] = cor(H.score.comb[,i], H.score.comb$feature.to.test, use = "pairwise.complete.obs")
