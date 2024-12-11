@@ -1,9 +1,13 @@
-#' Run dimensionality reduction (iNMF) at multiple ranks k 
+#' Run dimensionality reduction (iNMF) at multiple ranks k
 #'
 #' @param seurat.object A seurat object containing raw RNA counts
-#' @param assay_slot Which seurat assay_slot to perform NMF on, defaults to RNA     counts. For advanced users, see documentation for discussion of performing NMF    on SCTransformed count data.
-#' @param Sample.thresh Minimum number of samples a given cell type must be         present across for NMF
-#' @param Type.thresh Minimum number of cells per cell type in n Sample.thresh      samples to be included for NMF
+#' @param assay_slot Which seurat assay_slot to perform NMF on, defaults to RNA
+#'   counts. For advanced users, see documentation for discussion of performing
+#'   NMF    on SCTransformed count data.
+#' @param Sample.thresh Minimum number of samples a given cell type must be
+#'   present across for NMF
+#' @param Type.thresh Minimum number of cells per cell type in n Sample.thresh
+#'   samples to be included for NMF
 #' @param Batch Sequencing batch
 #' @param scale.factor Scale.factor for count normalization
 #' @param log.norm Perform log normalization on counts
@@ -16,6 +20,7 @@
 #'
 #' @returns a list containing k sweep consensus NMF results
 #'
+#' @import spatstat.explore
 #' @import Seurat
 #' @import rliger
 #' @import Matrix
@@ -48,15 +53,17 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
     stop('Supplied assay slot not in sequencing object')
   DefaultAssay(seurat.object)=assay_slot
   }
-  # Process Seurat object and determine which cell types to analyze
-  # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
+  # Process Seurat object and determine which cell types to analyze. Only run
+  # analysis on cell types that represented across at least 10 samples with at
+  # least 100 cells per sample (or adjust inputs above)
   cell.types <- names(which(colSums(table(seurat.object@meta.data[,c("Sample","CellType")])>=Type.thresh)>=Sample.thresh))
   if (length(cell.types)==0){
     stop("Not enough cells to meet input Sample/Type thresholds")
   } else if (length(cell.types)==1){
     warning("Only one cell type met input Sample/Type thresholds")
   }
-  print(paste0("Running consensus iNMF on the following ", length(cell.types), " cell types: ", paste(cell.types, collapse = ", ")))
+  print(paste0("Running consensus iNMF on the following ",
+               length(cell.types), " cell types: ", paste(cell.types, collapse = ", ")))
 
   # SET UP LIGER OBJECTS AND RUN K SWEEP
   print(paste0('Creating Liger objects and running k sweep...'))
@@ -69,28 +76,40 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
         Batch.list <- SplitObject(seu_sub, split.by="Batch")
         Liger.setup=list()
         for (j in 1:length(Batch.list)){
-          Liger.setup[[j]]=GetAssayData(Batch.list[[j]], slot = 'counts') #updating so single function interoperable with multiple data slots, using improved interaction functions for SeuratObject
+          Liger.setup[[j]]=GetAssayData(Batch.list[[j]], slot = 'counts')
+          #updating so single function interoperable with multiple data slots,
+          #using improved interaction functions for SeuratObject
         }
         names(Liger.setup)=names(Batch.list)
         Liger <- createLiger(Liger.setup)
       }
     } else {
-      seu_sub <- AddMetaData(seu_sub, col.name = 'Batch', metadata = rep('Batch1', nrow(seu_sub@meta.data)))
-      Liger <- createLiger(list(Batch1 = GetAssayData(seu_sub, slot = 'counts'))) #even for SCT normalization, residuals converted back to 'corrected' UMI counts, pre log-normalization per SeuratV5 Documentation
+      seu_sub <- AddMetaData(seu_sub,
+                             col.name = 'Batch',
+                             metadata = rep('Batch1', nrow(seu_sub@meta.data)))
+      Liger <- createLiger(list(Batch1 = GetAssayData(seu_sub, slot = 'counts')))
+      #even for SCT normalization, residuals converted back to 'corrected' UMI
+      #counts, pre log-normalization per SeuratV5 Documentation
     }
     # normalize so all cells have same total counts
-    Liger <- rliger::normalize(Liger) #still need to select variable genes for object regardless of normalization method
+    Liger <- rliger::normalize(Liger) #still need to select variable genes for
+      #object regardless of normalization method
     Liger <- selectGenes(Liger)
     if (log.norm){
-      # log normalize (this combined with the normalize step above is the same as LogNormalize in Seurat)
+      # log normalize (this combined with the normalize step above is the same
+      #as LogNormalize in Seurat)
       for (k in 1:length(Liger@norm.data)){
         Liger@norm.data[[k]]=as.sparse(as.matrix(log1p(Liger@norm.data[[k]]*scale.factor)))}
     } else{
       for (k in 1:length(Liger@norm.data)){
-        Liger@norm.data[[k]]=as.sparse(as.matrix(Liger@norm.data[[k]]))} #should always be counts slot regardless of normalization/pre-processing method
+        Liger@norm.data[[k]]=as.sparse(as.matrix(Liger@norm.data[[k]]))}
+        #should always be counts slot regardless of normalization/pre-processing
+        #method
     }
     # scale without centering
-    Liger <- rliger::scaleNotCenter(Liger) # does need to be re-scaled (if integrated, pull from integrated assay's data slot not integrated assay's 'scale.data' slot)
+    Liger <- rliger::scaleNotCenter(Liger)
+    # does need to be re-scaled (if integrated, pull from integrated assay's
+    # data slot not integrated assay's 'scale.data' slot)
 
     # adjust online_iNMF parameters based on dataset size
     minibatch_size <- min(table(seu_sub@meta.data$Batch))
@@ -102,7 +121,7 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
     h5_chunk_size <- min(1000, minibatch_size)
 
     Liger_list = list()
-    for (k in c(k.min:k.max)){ 
+    for (k in c(k.min:k.max)){
       print(paste0('Running K = ', k))
       reps.k = rep(k, n.reps)
       names(reps.k) = paste0("rep", 1:length(reps.k))
@@ -110,9 +129,12 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
       clusterExport(cl=cl, c('Liger', 'reps.k', 'minibatch_size', 'h5_chunk_size'),
                     unclass(lsf.str(envir = asNamespace("deciphR"), all = T)),
                     envir = as.environment(asNamespace("deciphR")))
-      Liger_list[[paste0("R", k)]] = clusterMap(cl, LIGER.run, K = reps.k, Liger = c(Liger),
-                                              minibatch_size = minibatch_size, h5_chunk_size = h5_chunk_size,
-                                              SIMPLIFY = F)
+      Liger_list[[paste0("R", k)]] = clusterMap(cl, LIGER.run,
+                                                K = reps.k,
+                                                Liger = c(Liger),
+                                                minibatch_size = minibatch_size,
+                                                h5_chunk_size = h5_chunk_size,
+                                                SIMPLIFY = F)
       stopCluster(cl)
       for (i in 1:length(Liger_list[[paste0("R", k)]])){
         colnames(Liger_list[[paste0("R", k)]][[i]][["W"]]) =  paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["W"]]))
@@ -215,14 +237,18 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
   return(res)
 }
 
-#' LIGER.run() is a helper function to run a single replicate of iNMF at a given   rank K.
-#'
+#' LIGER.run() is a helper function to run a single replicate of iNMF at a given
+#' rank K.
+#
 #' @param K rank to use for dimensionality reduction
-#' @param Liger input object containing counts after scaling, normalization, and   variable feature selection
-#' @params minibatch_size, h5_chunk_size A pair of integers that define how to     subset Liger object based on dataset size
-#'    *`minibatch_size` refers to number of cells in Liger object format
-#'    * `h5_chunk_size` refers to the HDF5 file format size
-#'  For more information on the computational advantages of minibatching that         online iNMF uses, see iNMF paper and original online learning paper.
+#' @param Liger input object containing counts after scaling, normalization, and
+#'   variable feature selection
+#' @param minibatch_size,h5_chunk_size  A pair of integers that define how to
+#'   subset Liger object based on dataset size *`minibatch_size` refers to
+#'   number of cells in Liger object format * `h5_chunk_size` refers to the HDF5
+#'   file format size For more information on the computational advantages of
+#'   minibatching that online iNMF uses, see iNMF paper and original online
+#'   learning paper.
 #' @param seed initialization value for a given iteration of iNMF
 LIGER.run <- function(K, Liger, minibatch_size, h5_chunk_size, seed = NULL){
   # sample seeds and report for reproducibility

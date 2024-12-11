@@ -2,7 +2,7 @@
 % Please edit documentation in R/iNMF_ksweep.R
 \name{iNMF_ksweep}
 \alias{iNMF_ksweep}
-\title{Multiplies two numbers, adds a constant, and returns the result}
+\title{Run dimensionality reduction (iNMF) at multiple ranks k}
 \usage{
 iNMF_ksweep(
   seurat.object,
@@ -18,23 +18,43 @@ iNMF_ksweep(
   nn.pt = 0.3,
   max.cores = parallelly::availableCores(),
   output.reps = FALSE,
-  return.scale.data = T
+  return.scale.data = F
 )
 }
 \arguments{
 \item{seurat.object}{A seurat object containing raw RNA counts}
 
-\item{assay_slot}{Which seurat assay_slot to perform NMF on, defaults to RNA counts. For advanced users, see documentation for discussion of performing NMF on SCTransformed count data.}
+\item{assay_slot}{Which seurat assay_slot to perform NMF on, defaults to RNA
+counts. For advanced users, see documentation for discussion of performing
+NMF    on SCTransformed count data.}
 
-\item{Type.thresh}{Minimum number of cells per cell type in n Sample.thresh samples to be included for NMF}
+\item{Type.thresh}{Minimum number of cells per cell type in n Sample.thresh
+samples to be included for NMF}
 
-\item{Sample.thresh}{Minimum number of samples a given cell type must be present across for NMF}
+\item{Sample.thresh}{Minimum number of samples a given cell type must be
+present across for NMF}
 
-\item{return.scale.data}{}
+\item{Batch}{Sequencing batch}
+
+\item{scale.factor}{Scale.factor for count normalization}
+
+\item{log.norm}{Perform log normalization on counts}
+
+\item{k.min, k.max}{Max and min ranks k for parameter sweep}
+
+\item{n.reps}{Number of reps for consensus nmf}
+
+\item{nn.pt}{Resolution for nearest neighbors clustering for consensus nmf}
+
+\item{max.cores}{N cores to use for parallelization.}
+
+\item{output.reps}{Save individual NMF reps. Default FALSE.}
+
+\item{return.scale.data}{Save scaled data. Default FALSE.}
 }
 \value{
 a list containing k sweep consensus NMF results
 }
 \description{
-Run iNMF via liger
+Run dimensionality reduction (iNMF) at multiple ranks k
 }
