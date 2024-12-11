@@ -1,23 +1,20 @@
-#' Run iNMF via liger
-#' @export
-
-#' @title Multiplies two numbers, adds a constant, and returns the result
-#' @name iNMF_ksweep
+#' Run dimensionality reduction (iNMF) at multiple ranks k 
+#'
 #' @param seurat.object A seurat object containing raw RNA counts
-#' @param assay_slot Which seurat assay_slot to perform NMF on, defaults to RNA counts. For advanced users, see documentation for discussion of performing NMF on SCTransformed count data.
-#' @param Sample.thresh Minimum number of samples a given cell type must be present across for NMF
-#' @param Type.thresh Minimum number of cells per cell type in n Sample.thresh samples to be included for NMF
+#' @param assay_slot Which seurat assay_slot to perform NMF on, defaults to RNA     counts. For advanced users, see documentation for discussion of performing NMF    on SCTransformed count data.
+#' @param Sample.thresh Minimum number of samples a given cell type must be         present across for NMF
+#' @param Type.thresh Minimum number of cells per cell type in n Sample.thresh      samples to be included for NMF
 #' @param Batch Sequencing batch
 #' @param scale.factor Scale.factor for count normalization
 #' @param log.norm Perform log normalization on counts
-#' @param k.min,k.max Max and min k's for k.sweep
+#' @param k.min,k.max Max and min ranks k for parameter sweep
 #' @param n.reps Number of reps for consensus nmf
 #' @param nn.pt Resolution for nearest neighbors clustering for consensus nmf
 #' @param max.cores N cores to use for parallelization.
 #' @param output.reps Save individual NMF reps. Default FALSE.
-#' @param return.scale.data Save scaled data. Defualt FALSE
+#' @param return.scale.data Save scaled data. Default FALSE.
 #'
-#' @return a list containing k sweep consensus NMF results
+#' @returns a list containing k sweep consensus NMF results
 #'
 #' @import Seurat
 #' @import rliger
@@ -30,9 +27,8 @@
 #' @import rlist
 #' @import liger
 #' @import RANN
+
 #' @export
-
-
 iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sample.thresh = 10, Batch = TRUE,
                             scale.factor = 10000, log.norm = TRUE, k.min = 2, k.max = 40, n.reps = 20, nn.pt = 0.3,
                             max.cores = parallelly::availableCores(), output.reps = FALSE, return.scale.data = F){
@@ -106,9 +102,7 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
     h5_chunk_size <- min(1000, minibatch_size)
 
     Liger_list = list()
-    for (k in c(k.min:k.max)){ #because for loop is outside forking step where individual reps are run,
-      #each previous k in Liger_list (with reps.k) is stored and then exported to the forked workers!!!
-      #exponentially increasing memory load. that's why she crashes!!!!!!
+    for (k in c(k.min:k.max)){ 
       print(paste0('Running K = ', k))
       reps.k = rep(k, n.reps)
       names(reps.k) = paste0("rep", 1:length(reps.k))
@@ -141,11 +135,11 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
       W.mat = list.rbind(W_list)
       kmeans_clusts = dim(W.mat)[1]/n.reps
 
-      # find mean distance to nearest neighbors
+      # find replicates' mean distance to nearest neighbors
       nn.dist = rowMeans(RANN::nn2(as.matrix(W.mat), k = n.reps)$nn.dists[,c(1:round(n.reps*nn.pt))+1])
       names(nn.dist) = rownames(W.mat)
 
-      # filter outliers
+      # filter outliers based on Euclidean distance from neighbors
       min = diff(quantile(nn.dist, probs = c(0.25, 0.75)))*0.5 + quantile(nn.dist, probs = c(0.75))
       if (sum(nn.dist>min)>0) {
         W.mat.filt = W.mat[-which(nn.dist>min),]
@@ -153,7 +147,7 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
         W.mat.filt = W.mat
       }
 
-      # perform kmeans clustering
+      # perform kmeans clustering on gene loadings
       km.res = kmeans(W.mat.filt, centers = kmeans_clusts, nstart = 100, iter.max = 100)
 
       # find consensus W (shared gene loadings)
@@ -221,6 +215,15 @@ iNMF_ksweep <- function(seurat.object, assay_slot = 'RNA', Type.thresh = 100, Sa
   return(res)
 }
 
+#' LIGER.run() is a helper function to run a single replicate of iNMF at a given   rank K.
+#'
+#' @param K rank to use for dimensionality reduction
+#' @param Liger input object containing counts after scaling, normalization, and   variable feature selection
+#' @params minibatch_size, h5_chunk_size A pair of integers that define how to     subset Liger object based on dataset size
+#'    *`minibatch_size` refers to number of cells in Liger object format
+#'    * `h5_chunk_size` refers to the HDF5 file format size
+#'  For more information on the computational advantages of minibatching that         online iNMF uses, see iNMF paper and original online learning paper.
+#' @param seed initialization value for a given iteration of iNMF
 LIGER.run <- function(K, Liger, minibatch_size, h5_chunk_size, seed = NULL){
   # sample seeds and report for reproducibility
   if (is.null(seed)) {seed = sample(1:1000000, 1)}
